@@ -1,58 +1,41 @@
 #include <Arduino.h>
 #include <ModbusMaster.h>
 
-// ---- Modbus RTU serial link (RS-485 to the servo network) ----
-constexpr int MODBUS_RX_PIN = 17;
-constexpr int MODBUS_TX_PIN = 18;
-constexpr int MODBUS_DE_RE_PIN = 4; // RS-485 driver enable; tie module to auto-direction if it has no DE/RE pin
+// ---- Bench test setup: no RS-485 yet ----
+// The S3 DevKitC-1 has two USB-C ports:
+//   "USB"  (native CDC, this sketch's `Serial`)  -> cable to the Mac, opened by Modbus Server Pro
+//   "UART" (via CP2102, this sketch's `Serial0`) -> cable to the Mac, used only for debug prints
 constexpr uint32_t MODBUS_BAUD = 9600;
 
-// ---- Servo polled on the Modbus network ----
 constexpr uint8_t SERVO_SLAVE_ID = 1;
 constexpr uint16_t HOLDING_REG_START = 0;
 constexpr uint16_t HOLDING_REG_COUNT = 8;
 
-HardwareSerial ModbusSerial(1);
 ModbusMaster node;
 
-void preTransmission() {
-  digitalWrite(MODBUS_DE_RE_PIN, HIGH);
-}
-
-void postTransmission() {
-  digitalWrite(MODBUS_DE_RE_PIN, LOW);
-}
-
 void setup() {
-  Serial.begin(115200);
-  while (!Serial) {
+  Serial0.begin(115200);
+  while (!Serial0) {
     delay(10);
   }
 
-  pinMode(MODBUS_DE_RE_PIN, OUTPUT);
-  digitalWrite(MODBUS_DE_RE_PIN, LOW);
+  Serial.begin(MODBUS_BAUD);
+  node.begin(SERVO_SLAVE_ID, Serial);
 
-  ModbusSerial.begin(MODBUS_BAUD, SERIAL_8N1, MODBUS_RX_PIN, MODBUS_TX_PIN);
-  node.begin(SERVO_SLAVE_ID, ModbusSerial);
-  node.preTransmission(preTransmission);
-  node.postTransmission(postTransmission);
-
-  Serial.println("ESP32 Modbus Gateway - master starting");
+  Serial0.println("ESP32 Modbus master - bench test starting");
 }
 
 void loop() {
   uint8_t result = node.readHoldingRegisters(HOLDING_REG_START, HOLDING_REG_COUNT);
 
   if (result == node.ku8MBSuccess) {
-    Serial.printf("Servo %u registers: ", SERVO_SLAVE_ID);
+    Serial0.printf("Holding registers: ");
     for (uint16_t i = 0; i < HOLDING_REG_COUNT; i++) {
-      Serial.printf("%u ", node.getResponseBuffer(i));
+      Serial0.printf("%u ", node.getResponseBuffer(i));
     }
-    Serial.println();
-
-    // TODO: publish these values to the cloud once the transport (MQTT/HTTP) is decided
+    Serial0.println();
   } else {
-    Serial.printf("Modbus read failed, error code: 0x%02X\n", result);
+    Serial0.printf("Modbus read failed, error code: 0x%02X\n", result);
   }
 
   delay(1000);
