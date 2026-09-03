@@ -5,43 +5,48 @@ an RS-485 network, and forwards the readings to the cloud.
 
 ## Hardware
 
-**Current bench test (no RS-485 yet):** a classic ESP32 DevKit has a single
-serial link — UART0, over the onboard USB-serial chip. That link stays
-dedicated to Modbus RTU traffic with Modbus Server Pro on the Mac, so there
-is no room on the wire for debug prints at the same time:
+Modbus RTU runs on **UART2** through an RS-485 transceiver module
+(MAX485/MAX3485), which keeps **UART0/USB free for debug prints** via
+`Serial` and `pio device monitor`.
 
-- Onboard **LED (GPIO2)** blinks once (150ms) on a successful read, or three
-  times fast (80ms) on failure/timeout.
-- The actual register values are visible in Modbus Server Pro's own
-  **Data Log** window (request/response bytes) and in the Holding table
-  you configured.
+**Mac side:** USB-RS485 dongle, opened as the serial port in Modbus Server
+Pro.
 
-**Later, on the real network:** move Modbus off UART0 onto a spare
-`HardwareSerial` (e.g. UART2, GPIO16/17) wired to an RS-485 transceiver
-(DE/RE pin toggled around each transaction). That frees UART0/USB for
-normal debug output again.
+**ESP32 side:** RS-485 module wired as:
+
+| Module pin | Connects to |
+|---|---|
+| A | A wire from the Mac's USB-RS485 dongle |
+| B | B wire from the Mac's USB-RS485 dongle |
+| RO | ESP32 GPIO16 (RX2) |
+| DI | ESP32 GPIO17 (TX2) |
+| DE + RE (tied together) | ESP32 GPIO23 |
+| VCC | ESP32 5V (or 3V3 if the module is a MAX3485) |
+| GND | ESP32 GND |
+
+If reads keep timing out after wiring, try swapping A/B — labeling isn't
+always consistent between manufacturers.
 
 ## Build / flash / monitor
 
 ```sh
 pio run                # build
 pio run -t upload      # flash
-pio device monitor      # only useful before/after the Modbus test,
-                         # since UART0 is occupied by Modbus while polling
+pio device monitor      # debug output (Serial), independent of the Modbus link
 ```
 
 ## Bench test steps
 
-1. In Modbus Server Pro (RTU tab), set the Serial Port to the ESP32's
-   USB-serial port, baud 9600 / 8 / none / 1, and add a few Holding
-   register rows (addresses 0-7) with test values. Click Connect.
-2. Flash this firmware.
-3. Watch the onboard LED: one blink per second = successful read; three
-   fast blinks = failure. Check the Data Log window in the app to see the
-   actual bytes/values being exchanged.
+1. Plug the USB-RS485 dongle into the Mac. In Modbus Server Pro (RTU tab),
+   select that port, baud 9600 / 8 / none / 1, Device ID 1.
+2. Add a few Holding register rows (addresses 0-7) with test values, click
+   Connect.
+3. Wire the ESP32-side RS-485 module per the table above, flash this
+   firmware, and open the serial monitor.
+4. You should see the 8 holding register values printed once per second.
 
 ## Status
 
-- [x] Modbus RTU master polling holding registers (bench test over USB)
-- [ ] RS-485 wiring for the real servo network
+- [x] Modbus RTU master polling holding registers over RS-485
+- [ ] Real servo network (multiple slaves)
 - [ ] Cloud publishing (transport/provider TBD)
