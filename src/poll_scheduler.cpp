@@ -8,9 +8,6 @@
 
 namespace {
 
-// Same chunking as modbusTask's executeRead (ModbusMaster's 64-word buffer).
-constexpr uint16_t kChunkRegisters = 64;
-constexpr uint16_t kChunkBits = 64 * 16;
 // Slave turnaround + inter-frame gap per transaction, on top of the bytes.
 constexpr float kTransactionOverheadMs = 10.0f;
 constexpr uint32_t kBackoffBaseMs = 250;
@@ -23,7 +20,7 @@ float frameMs(uint32_t bytes) {
 // Estimated bus time to read `count` addresses, including chunking.
 float readCostMs(ModbusTable table, uint16_t count) {
   bool bits = isBitTable(table);
-  uint16_t chunk = bits ? kChunkBits : kChunkRegisters;
+  uint16_t chunk = readChunkSize(table);
   float total = 0;
   for (uint32_t offset = 0; offset < count; offset += chunk) {
     uint16_t quantity = std::min<uint32_t>(chunk, count - offset);
@@ -46,7 +43,7 @@ int PollScheduler::findSubscription(uint32_t clientId, const char *id) const {
   return -1;
 }
 
-bool PollScheduler::rebuildBlocks(uint32_t now) {
+bool PollScheduler::rebuildBlocks(uint32_t now, bool enforceLimit) {
   std::vector<size_t> order(subs_.size());
   for (size_t i = 0; i < order.size(); i++) order[i] = i;
   std::sort(order.begin(), order.end(), [this](size_t a, size_t b) {
@@ -63,7 +60,7 @@ bool PollScheduler::rebuildBlocks(uint32_t now) {
   for (size_t idx : order) {
     const Subscription &sub = subs_[idx];
     uint32_t subEnd = static_cast<uint32_t>(sub.start) + sub.count;
-    uint16_t maxCount = isBitTable(sub.table) ? MODBUS_MAX_READ_BITS : MODBUS_MAX_READ_REGISTERS;
+    uint16_t maxCount = maxReadCount(sub.table);
 
     bool merged = false;
     if (!next.empty()) {
@@ -88,7 +85,7 @@ bool PollScheduler::rebuildBlocks(uint32_t now) {
     }
     assignment[idx] = next.size() - 1;
   }
-  if (next.size() > WS_MAX_BLOCKS) return false;
+  if (enforceLimit && next.size() > WS_MAX_BLOCKS) return false;
 
   // Bus budget: stretch every interval by the same factor when the
   // requested polling would take more than WS_BUS_BUDGET of the bus.
@@ -100,16 +97,23 @@ bool PollScheduler::rebuildBlocks(uint32_t now) {
   }
 
   // Keep timing, backoff and cached values of blocks that didn't change.
+  // (blocks_ is replaced below, so its values can be moved out.)
   for (PollBlock &block : next) {
     block.nextDueAt = now;
-    for (const PollBlock &old : blocks_) {
+    for (PollBlock &old : blocks_) {
       if (old.slave == block.slave && old.table == block.table && old.start == block.start &&
           old.count == block.count) {
         block.nextDueAt = old.nextDueAt;
+        // A faster subscriber joined: due one (new) interval after the
+        // last read, not at the end of the old, longer interval.
+        if (old.hasValues) {
+          uint32_t sooner = old.lastReadAt + block.intervalMs;
+          if (static_cast<int32_t>(sooner - old.nextDueAt) < 0) block.nextDueAt = sooner;
+        }
         block.lastReadAt = old.lastReadAt;
         block.failures = old.failures;
         block.hasValues = old.hasValues;
-        block.values = old.values;
+        block.values = std::move(old.values);
         break;
       }
     }
@@ -142,7 +146,7 @@ void PollScheduler::subscribe(const SubscribeRequest &request, uint32_t now) {
   }
   auto restorePrevious = [&]() {
     if (hadPrevious) subs_.push_back(previous);
-    rebuildBlocks(now); // can't fail: back to a state that fitted before
+    rebuildBlocks(now, false); // back to the previous subscriptions
   };
 
   size_t clientSubs = 0;
@@ -180,7 +184,7 @@ void PollScheduler::subscribe(const SubscribeRequest &request, uint32_t now) {
   sub.block = -1;
   subs_.push_back(sub);
 
-  if (!rebuildBlocks(now)) {
+  if (!rebuildBlocks(now, true)) {
     subs_.pop_back();
     restorePrevious();
     wsSendError(request.clientId, request.id, "too_many_blocks",
@@ -206,7 +210,7 @@ void PollScheduler::unsubscribe(uint32_t clientId, const char *id, uint32_t now)
     return;
   }
   subs_.erase(subs_.begin() + index);
-  rebuildBlocks(now);
+  rebuildBlocks(now, false);
   reportIntervals();
   wsSendUnsubscribed(clientId, id);
 }
@@ -217,7 +221,7 @@ void PollScheduler::removeClient(uint32_t clientId, uint32_t now) {
                              [clientId](const Subscription &sub) { return sub.clientId == clientId; }),
               subs_.end());
   if (subs_.size() == before) return;
-  rebuildBlocks(now);
+  rebuildBlocks(now, false);
   reportIntervals();
 }
 

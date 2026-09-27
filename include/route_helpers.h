@@ -12,7 +12,13 @@
 // Registers a route whose body is a JSON object. Handles the chunked
 // onBody accumulation (see ESPAsyncWebServer's `_tempObject` idiom) and
 // only invokes `handler` once the body parsed successfully -- otherwise
-// responds 400 itself.
+// responds 400 itself, or 413 above MAX_JSON_BODY_BYTES.
+//
+// The largest valid body (64 values of 65535) is ~450 bytes; the cap
+// leaves room for pretty-printed JSON while keeping one request from
+// claiming the heap (the buffer size comes from the client's
+// Content-Length).
+constexpr size_t MAX_JSON_BODY_BYTES = 2048;
 using JsonBodyHandler = std::function<void(AsyncWebServerRequest *, JsonVariantConst)>;
 void registerJsonRoute(AsyncWebServer &server, const String &uri,
                         WebRequestMethodComposite method, JsonBodyHandler handler);

@@ -5,13 +5,10 @@
 #include "config.h"
 #include "json_codec.h"
 #include "poll_scheduler.h"
+#include "ws_stream.h"
 
 namespace {
 
-// ModbusMaster's response/transmit buffers hold 64 words, so one read
-// transaction carries at most 64 registers or 64 * 16 bits.
-constexpr uint16_t kChunkRegisters = 64;
-constexpr uint16_t kChunkBits = 64 * 16;
 // Silence between consecutive transactions (> 3.5 chars at 9600 baud).
 constexpr uint32_t kInterFrameGapMs = 5;
 // Longest the task sleeps without checking for new subscription commands.
@@ -91,13 +88,13 @@ uint8_t readChunk(ModbusFunction function, uint16_t address, uint16_t quantity) 
 
 // Reads `count` registers/bits of `table` into `out` (one entry per
 // address, bits as 0/1), splitting into as many transactions as
-// ModbusMaster needs.
+// ModbusMaster needs (readChunkSize).
 uint8_t executeRead(uint8_t slave, ModbusTable table, uint16_t address, uint16_t count,
                     uint16_t *out) {
   node.begin(slave, Serial2);
   ModbusFunction function = readFunctionFor(table);
   bool bits = isBitTable(table);
-  uint16_t chunk = bits ? kChunkBits : kChunkRegisters;
+  uint16_t chunk = readChunkSize(table);
 
   for (uint32_t offset = 0; offset < count; offset += chunk) {
     if (offset > 0) vTaskDelay(pdMS_TO_TICKS(kInterFrameGapMs));
@@ -157,7 +154,10 @@ void runJob(ModbusJob &job) {
   uint8_t result;
   if (isWriteFunction(job.function)) {
     result = executeWrite(job);
-    if (result == MODBUS_RESULT_OK) {
+    // Only an exception reply (0x01-0x04) proves the slave left the data
+    // alone. After a link failure (timeout, bad CRC...) the write may
+    // still have been applied, so the cached values can't be trusted.
+    if (!isModbusException(result)) {
       scheduler.invalidate(job.slave, job.table, job.address, job.count, millis());
     }
   } else {
@@ -234,13 +234,19 @@ void drainCommands() {
 }
 
 void modbusTaskFn(void *) {
-  Serial2.begin(MODBUS_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+  Serial2.begin(MODBUS_BAUD, MODBUS_SERIAL_CONFIG, RS485_RX_PIN, RS485_TX_PIN);
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
   node.setResponseTimeout(MODBUS_RESPONSE_TIMEOUT_MS);
+  // Called while waiting for the reply's next byte. Without it that wait
+  // spins for up to the full timeout, starving loop() (WebSocket cleanup)
+  // and the idle task on this core. One tick (~1 ms, about one byte at
+  // 9600 baud) loses nothing: the UART buffers the reply meanwhile.
+  node.idle([] { vTaskDelay(1); });
 
   while (true) {
     drainCommands();
+    wsFlushReplies();
     updateLed();
 
     // Sleep until an API job arrives, the next block is due, or it's time

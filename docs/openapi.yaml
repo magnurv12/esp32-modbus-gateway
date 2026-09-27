@@ -200,6 +200,7 @@ paths:
                 status: written
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/IllegalAddress' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '502': { $ref: '#/components/responses/BadGateway' }
         '503': { $ref: '#/components/responses/Busy' }
         '504': { $ref: '#/components/responses/SlaveTimeout' }
@@ -243,6 +244,7 @@ paths:
               example: { table: holding, slave: 1, functionCode: 6, address: 2, value: 77, status: written }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/IllegalAddress' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '502': { $ref: '#/components/responses/BadGateway' }
         '503': { $ref: '#/components/responses/Busy' }
         '504': { $ref: '#/components/responses/SlaveTimeout' }
@@ -349,6 +351,7 @@ paths:
               schema: { $ref: '#/components/schemas/BitBlockWritten' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/IllegalAddress' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '502': { $ref: '#/components/responses/BadGateway' }
         '503': { $ref: '#/components/responses/Busy' }
         '504': { $ref: '#/components/responses/SlaveTimeout' }
@@ -392,6 +395,7 @@ paths:
               example: { table: coils, slave: 1, functionCode: 5, address: 1, state: true, status: written }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/IllegalAddress' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '502': { $ref: '#/components/responses/BadGateway' }
         '503': { $ref: '#/components/responses/Busy' }
         '504': { $ref: '#/components/responses/SlaveTimeout' }
@@ -471,6 +475,20 @@ paths:
                 wifiRssi: -69
                 wifiIp: 192.168.20.8
                 defaultSlave: 1
+                resetReason: power_on
+                wifi:
+                  ssid: plant-wifi
+                  rssi: -69
+                  ip: 192.168.20.8
+                  hostname: modbus-gateway.local
+                  mac: '4C:C3:82:0B:FA:70'
+                  channel: 1
+                firmware:
+                  version: v1.1.0
+                  buildTime: '2026-09-27T20:47:44Z'
+                  arduinoCore: 2.0.17
+                  idf: v4.4.7
+                  chip: ESP32-D0WD-V3
                 modbus:
                   okCount: 42
                   errorCount: 3
@@ -479,6 +497,11 @@ paths:
                   lastAttemptAt: 30512
                   lastSuccessAt: 30512
                   cacheHits: 5
+                  config:
+                    baud: 9600
+                    format: 8N1
+                    responseTimeoutMs: 400
+                    defaultSlave: 1
                 stream:
                   clients: 1
                   subscriptions: 2
@@ -499,8 +522,11 @@ components:
       name: slave
       in: query
       required: false
-      description: Slave (unit) id. Defaults to `DEFAULT_SLAVE_ID` from `config.h` (see `/api/health`).
-      schema: { type: integer, minimum: 1, maximum: 247 }
+      description: |
+        Slave (unit) id, 1-247. Defaults to `DEFAULT_SLAVE_ID` from `config.h`
+        (1; see `/api/health`). 0 is the RTU broadcast address: slaves never
+        answer it, so it isn't accepted.
+      schema: { type: integer, minimum: 1, maximum: 247, default: 1 }
     Start:
       name: start
       in: query
@@ -662,6 +688,7 @@ components:
             - missing_parameter
             - invalid_parameter
             - invalid_body
+            - body_too_large
             - not_found
             - read_only
             - busy
@@ -702,13 +729,39 @@ components:
 
     Health:
       type: object
-      required: [uptimeMs, freeHeap, wifiRssi, wifiIp, defaultSlave, modbus, stream, modbusLinkUp]
+      required: [uptimeMs, freeHeap, wifiRssi, wifiIp, defaultSlave, resetReason, wifi, firmware, modbus, stream, modbusLinkUp]
       properties:
         uptimeMs: { type: integer }
         freeHeap: { type: integer, description: Free heap in bytes. }
-        wifiRssi: { type: integer, description: WiFi signal in dBm. }
-        wifiIp: { type: string }
-        defaultSlave: { type: integer, description: Slave used when `?slave=` is omitted. }
+        wifiRssi: { type: integer, description: 'WiFi signal in dBm (same as `wifi.rssi`, kept for existing clients).' }
+        wifiIp: { type: string, description: 'Same as `wifi.ip`, kept for existing clients.' }
+        defaultSlave: { type: integer, description: 'Slave used when `?slave=` is omitted.' }
+        resetReason:
+          type: string
+          description: |
+            Why the chip last started. `power_on` and `software` are normal (a
+            reset through the EN pin -- including after flashing -- also reads
+            `power_on`). `panic` means it crashed, `brownout` that the supply
+            voltage sagged (weak USB port or supply), `*_watchdog` that something
+            hung. A low `uptimeMs` with one of those is worth investigating.
+          enum: [power_on, external_pin, software, panic, interrupt_watchdog, task_watchdog, other_watchdog, deep_sleep, brownout, sdio, unknown]
+        wifi:
+          type: object
+          properties:
+            ssid: { type: string, description: Network the gateway joined. }
+            rssi: { type: integer, description: 'Signal in dBm; below about -80 expect drops.' }
+            ip: { type: string }
+            hostname: { type: string, description: mDNS name. }
+            mac: { type: string }
+            channel: { type: integer }
+        firmware:
+          type: object
+          properties:
+            version: { type: string, description: '`git describe` at build time (`-dirty` = uncommitted changes), or `unknown`.' }
+            buildTime: { type: string, format: date-time, description: Build time (UTC). }
+            arduinoCore: { type: string, description: Arduino-ESP32 core version. }
+            idf: { type: string, description: ESP-IDF version. }
+            chip: { type: string }
         modbus:
           type: object
           properties:
@@ -721,6 +774,14 @@ components:
             lastAttemptAt: { type: integer, nullable: true, description: Uptime (ms) of the latest transaction. }
             lastSuccessAt: { type: integer, nullable: true }
             cacheHits: { type: integer, description: REST reads answered from live-polled data. }
+            config:
+              type: object
+              description: 'Serial settings in use (`config.h`) -- compare with the slave''s when requests time out.'
+              properties:
+                baud: { type: integer }
+                format: { type: string, description: 'Data bits, parity (N/E/O), stop bits, e.g. `8N1`.' }
+                responseTimeoutMs: { type: integer }
+                defaultSlave: { type: integer }
         stream:
           type: object
           description: WebSocket live polling (see `/ws`).
@@ -767,6 +828,14 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ModbusError' }
+    PayloadTooLarge:
+      description: |
+        The request body is larger than 2048 bytes (`body_too_large`) -- far more
+        than any valid write needs. The bus isn't touched.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: body_too_large, message: 'Request body must be at most 2048 bytes' }
     Busy:
       description: Too many requests already queued for the bus (queue of 8).
       content:

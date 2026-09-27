@@ -273,7 +273,7 @@ mDNS ativo: http://modbus-gateway.local/
 |---|---|
 | `http://modbus-gateway.local/docs` | Swagger UI — every route, with "Try it out" |
 | `http://modbus-gateway.local/ws-test` | Live WebSocket test page (works offline) |
-| `http://modbus-gateway.local/api/health` | Gateway status (JSON) |
+| `http://modbus-gateway.local/api/health` | Gateway status (JSON): WiFi network, firmware version, why it last restarted, Modbus settings and counters |
 
 ```bash
 # read holding registers 1..7 of slave 1
@@ -288,7 +288,7 @@ The onboard LED blinks on every successful Modbus reply. If it stays dark and th
 answers `504 slave_timeout`, see [Troubleshooting](#troubleshooting).
 
 > `.local` names work out of the box on macOS, iOS, Linux and Windows 10+. On Android and
-> some apps use the IP address shown in the boot log or in `/api/health` (`wifiIp`).
+> some apps use the IP address shown in the boot log or in `/api/health` (`wifi.ip`).
 
 ## Modbus in 2 minutes
 
@@ -368,6 +368,7 @@ curl -X PUT http://modbus-gateway.local/api/holding \
 | 404 | `illegal_address` | The device has no data there (exception 02) |
 | 404 | `not_found` | Unknown route |
 | 405 | `read_only` | `PUT` on input registers / discrete inputs |
+| 413 | `body_too_large` | `PUT` body over 2 KB (a valid write needs < 0.5 KB) |
 | 502 | `slave_failure`, `bad_response` | Device failure (exception 04) or corrupt reply (CRC, id) |
 | 503 | `busy` | Too many requests queued for the bus (8) |
 | 504 | `slave_timeout` | Nobody answered — wiring, slave id, baud rate |
@@ -431,7 +432,7 @@ What the gateway does for you:
   more, intervals are stretched and clients are told the `effectiveIntervalMs`.
 - **Write feedback** — after a successful `PUT`, subscribers see the new value ~70 ms later.
 - **Back-off** — a failing device is retried at 250 ms → 5 s instead of stalling the bus.
-- **Slow clients** — updates are skipped and a fresh snapshot is sent when they catch up.
+- **Slow clients** — updates are skipped and a fresh snapshot is sent when they catch up. Control replies (`subscribed`, `interval`, `unsubscribed`, errors) are never lost: they wait in a queue and go out in order, ahead of any data.
 
 Full protocol, message types and limits: [`docs/websocket.md`](docs/websocket.md).
 
@@ -547,6 +548,7 @@ The bus is the real limit: **one transaction at a time**, ~50 ms for ~10 registe
 |---|---|
 | Registers / bits per read | 125 / 2000 |
 | Values per write | 64 |
+| `PUT` body size | 2 KB |
 | Queued REST requests | 8 |
 | WebSocket connections | 4 |
 | Subscriptions per connection / total | 8 / 32 |
@@ -584,7 +586,9 @@ The bus is the real limit: **one transaction at a time**, ~50 ms for ~10 registe
   that network. Restrict CORS to your front-end's origin. Write only to addresses confirmed in the manual, and never rely on
   the gateway for safety functions — emergency stops and interlocks must stay hardwired.
 - **Match the bus settings.** Industrial buses often use **19200 8E1** (even parity, the
-  Modbus spec default); this firmware is fixed at 8N1 today.
+  Modbus spec default). Set `MODBUS_BAUD` and `MODBUS_SERIAL_CONFIG` /
+  `MODBUS_SERIAL_FORMAT` in `config.h`; `/api/health` (`modbus.config`) shows what the
+  running firmware uses.
 - **Hardware for the field:** isolated transceiver, surge protection, 24 V → 5 V DC-DC
   supply, and an enclosure with decent WiFi signal.
 - Always coordinate with whoever is responsible for the automation.

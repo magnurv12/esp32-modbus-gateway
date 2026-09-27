@@ -271,7 +271,7 @@ mDNS ativo: http://modbus-gateway.local/
 |---|---|
 | `http://modbus-gateway.local/docs` | Swagger UI — todas as rotas, com "Try it out" |
 | `http://modbus-gateway.local/ws-test` | Página de teste do WebSocket ao vivo (funciona offline) |
-| `http://modbus-gateway.local/api/health` | Status do gateway (JSON) |
+| `http://modbus-gateway.local/api/health` | Status do gateway (JSON): rede WiFi, versão do firmware, por que reiniciou por último, configuração e contadores Modbus |
 
 ```bash
 # lê os holding registers 1..7 do escravo 1
@@ -286,7 +286,7 @@ O LED da placa pisca a cada resposta Modbus bem-sucedida. Se ele ficar apagado e
 responder `504 slave_timeout`, veja [Solução de problemas](#solução-de-problemas).
 
 > Nomes `.local` funcionam direto no macOS, iOS, Linux e Windows 10+. No Android e em alguns
-> apps use o IP mostrado no log de boot ou no `/api/health` (`wifiIp`).
+> apps use o IP mostrado no log de boot ou no `/api/health` (`wifi.ip`).
 
 ## Modbus em 2 minutos
 
@@ -366,6 +366,7 @@ curl -X PUT http://modbus-gateway.local/api/holding \
 | 404 | `illegal_address` | O equipamento não tem dados ali (exceção 02) |
 | 404 | `not_found` | Rota inexistente |
 | 405 | `read_only` | `PUT` em input registers / discrete inputs |
+| 413 | `body_too_large` | Corpo do `PUT` acima de 2 KB (uma escrita válida precisa de < 0,5 KB) |
 | 502 | `slave_failure`, `bad_response` | Falha do equipamento (exceção 04) ou resposta corrompida (CRC, id) |
 | 503 | `busy` | Muitas requisições na fila do barramento (8) |
 | 504 | `slave_timeout` | Ninguém respondeu — ligação, slave id, baud rate |
@@ -431,7 +432,7 @@ O que o gateway faz por você:
 - **Retorno das escritas** — depois de um `PUT` bem-sucedido, quem assina vê o valor novo ~70 ms depois.
 - **Espera progressiva** — um equipamento com falha é tentado de novo de 250 ms até 5 s, em
   vez de travar o barramento.
-- **Clientes lentos** — atualizações são puladas e um snapshot novo é enviado quando o cliente se recupera.
+- **Clientes lentos** — atualizações são puladas e um snapshot novo é enviado quando o cliente se recupera. Respostas de controle (`subscribed`, `interval`, `unsubscribed`, erros) nunca se perdem: esperam numa fila e saem em ordem, antes de qualquer dado.
 
 Protocolo completo, tipos de mensagem e limites: [`docs/websocket.md`](docs/websocket.md) (em inglês).
 
@@ -546,6 +547,7 @@ O limite real é o barramento: **uma transação por vez**, ~50 ms para ~10 regi
 |---|---|
 | Registradores / bits por leitura | 125 / 2000 |
 | Valores por escrita | 64 |
+| Tamanho do corpo do `PUT` | 2 KB |
 | Requisições REST na fila | 8 |
 | Conexões WebSocket | 4 |
 | Assinaturas por conexão / total | 8 / 32 |
@@ -583,7 +585,9 @@ O limite real é o barramento: **uma transação por vez**, ~50 ms para ~10 regi
   rede também. Restrinja o CORS à origem do seu front-end. Escreva só em endereços confirmados no manual e nunca dependa do gateway
   para funções de segurança — emergência e intertravamentos devem continuar no hardware.
 - **Use as mesmas configurações do barramento.** Barramentos industriais usam muito
-  **19200 8E1** (paridade par, o padrão da especificação Modbus); este firmware hoje é fixo em 8N1.
+  **19200 8E1** (paridade par, o padrão da especificação Modbus). Ajuste `MODBUS_BAUD` e
+  `MODBUS_SERIAL_CONFIG` / `MODBUS_SERIAL_FORMAT` no `config.h`; o `/api/health`
+  (`modbus.config`) mostra o que o firmware em execução usa.
 - **Hardware de campo:** transceptor isolado, proteção contra surtos, fonte DC-DC de
   24 V → 5 V e um gabinete com sinal de WiFi razoável.
 - Sempre combine com o responsável pela automação.

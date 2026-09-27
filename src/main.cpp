@@ -31,12 +31,14 @@ void setup() {
   server.onNotFound([](AsyncWebServerRequest *request) {
     sendJsonError(request, 404, "not_found", "No such route");
   });
-  server.begin();
 
   // Owns the RS-485 bus exclusively: runs each API request's Modbus
   // transaction in arrival order and answers the paused HTTP request.
-  // HTTP handlers above never touch Serial2 directly.
+  // HTTP handlers never touch Serial2 directly. Order matters: the task
+  // uses the WebSocket state set up by registerWsStream(), and handlers
+  // use the task's mutex and queues from the very first request.
   startModbusTask();
+  server.begin();
 }
 
 void loop() {

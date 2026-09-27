@@ -102,9 +102,15 @@ public:
 
 private:
   int findSubscription(uint32_t clientId, const char *id) const;
-  // Recomputes blocks_ from subs_ (merge + bus budget). Returns false and
-  // leaves everything unchanged if the result would exceed WS_MAX_BLOCKS.
-  bool rebuildBlocks(uint32_t now);
+  // Recomputes blocks_ from subs_ (merge + bus budget). With
+  // `enforceLimit`, returns false and leaves everything unchanged if the
+  // result would exceed WS_MAX_BLOCKS. Removals don't enforce it: taking
+  // out a subscription that bridged two ranges can split a block, and
+  // refusing would keep polling a range nobody watches. The overshoot is
+  // bounded (every block has at least one subscription, and those are
+  // capped by WS_MAX_SUBSCRIPTIONS) and lasts until enough subscriptions
+  // leave; meanwhile new subscriptions that need a block are refused.
+  bool rebuildBlocks(uint32_t now, bool enforceLimit);
   void reportIntervals();
   void pushBlockToSubscriber(Subscription &sub, const PollBlock &block, uint32_t now);
 

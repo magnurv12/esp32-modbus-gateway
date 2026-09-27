@@ -51,6 +51,18 @@ constexpr uint16_t MODBUS_MAX_READ_REGISTERS = 125;
 constexpr uint16_t MODBUS_MAX_READ_BITS = 2000;
 constexpr uint16_t MODBUS_MAX_WRITE_VALUES = 64;
 
+// Largest read one request may ask for on `table`.
+inline uint16_t maxReadCount(ModbusTable table) {
+  return isBitTable(table) ? MODBUS_MAX_READ_BITS : MODBUS_MAX_READ_REGISTERS;
+}
+
+// ModbusMaster's response buffer holds 64 words, so one read transaction
+// carries at most 64 registers or 64 * 16 bits. Used both to split reads
+// (modbusTask) and to estimate their bus time (PollScheduler).
+inline uint16_t readChunkSize(ModbusTable table) {
+  return isBitTable(table) ? 64 * 16 : 64;
+}
+
 constexpr uint8_t MODBUS_MIN_SLAVE_ID = 1;
 constexpr uint8_t MODBUS_MAX_SLAVE_ID = 247;
 
@@ -59,6 +71,12 @@ constexpr uint8_t MODBUS_MAX_SLAVE_ID = 247;
 // usable came back at all).
 constexpr uint8_t MODBUS_RESULT_OK = 0x00;
 constexpr uint8_t MODBUS_RESULT_TIMEOUT = 0xE2;
+
+// The slave answered with an exception: it received the request and
+// refused it.
+inline bool isModbusException(uint8_t code) {
+  return code >= 0x01 && code <= 0x04;
+}
 
 inline const char *modbusResultName(uint8_t code) {
   switch (code) {

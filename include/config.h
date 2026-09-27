@@ -14,7 +14,12 @@ constexpr const char *MDNS_HOSTNAME = "modbus-gateway";
 
 // ---- RS-485 / Modbus RTU ----
 constexpr uint32_t MODBUS_BAUD = 9600;
-// Slave addressed when a request doesn't pass `?slave=`.
+// Data bits / parity / stop bits -- must match the slaves. Keep the two in
+// sync: the first configures Serial2, the second is what /api/health shows.
+constexpr uint32_t MODBUS_SERIAL_CONFIG = SERIAL_8N1;
+constexpr const char *MODBUS_SERIAL_FORMAT = "8N1";
+// Slave addressed when a request doesn't pass `?slave=`. 1-247: 0 is the
+// RTU broadcast address, which slaves never answer.
 constexpr uint8_t DEFAULT_SLAVE_ID = 1;
 constexpr int DE_RE_PIN = 23;
 constexpr int RS485_RX_PIN = 16; // RO

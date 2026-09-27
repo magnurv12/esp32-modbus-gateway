@@ -2,6 +2,9 @@
 
 #include <ArduinoJson.h>
 
+#include <algorithm>
+#include <map>
+
 #include "config.h"
 #include "json_codec.h"
 #include "modbus_task.h"
@@ -15,10 +18,94 @@ AsyncWebSocket ws("/ws");
 SemaphoreHandle_t pendingGoneMutex = nullptr;
 std::vector<uint32_t> pendingGone;
 
+// Per-client state shared by the async_tcp task (events), modbusTask
+// (sending) and loop() (cleanup), guarded by clientStateMutex.
+//
+// Lock order: the library raises CONNECT / DISCONNECT events while holding
+// its own client-list lock, and those handlers take clientStateMutex. So
+// no ws.* call may ever be made while holding clientStateMutex.
+SemaphoreHandle_t clientStateMutex = nullptr;
+
+// Control replies (subscribed, interval, unsubscribed, errors) are sent
+// once and never repeated, so they must not be lost when a slow client's
+// send queue is full (the library would drop them silently). They wait
+// here, oldest first, and are sent by wsFlushReplies() -- only ever called
+// from modbusTask, so a reply is never sent twice. While a client has
+// replies waiting, wsCanSend() says no, so data can't overtake them.
+struct PendingReply {
+  uint32_t clientId;
+  String text;
+};
+std::vector<PendingReply> outbox;
+// A client this far behind won't catch up: disconnect it (it reconnects
+// and subscribes again from a clean state).
+constexpr size_t kMaxPendingRepliesPerClient = 16;
+
+// Text frames that arrived in pieces (the frame spanned TCP segments),
+// by client.
+std::map<uint32_t, String> partialMessages;
+
+size_t pendingRepliesLocked(uint32_t clientId) {
+  return std::count_if(outbox.begin(), outbox.end(),
+                       [clientId](const PendingReply &reply) { return reply.clientId == clientId; });
+}
+
 void sendDoc(uint32_t clientId, JsonDocument &doc) {
   String out;
   serializeJson(doc, out);
   ws.text(clientId, out);
+}
+
+// Sends a control reply now if the client can take it and has nothing
+// queued before it; queues it otherwise.
+void sendReply(uint32_t clientId, JsonDocument &doc) {
+  String out;
+  serializeJson(doc, out);
+
+  xSemaphoreTake(clientStateMutex, portMAX_DELAY);
+  bool queued = pendingRepliesLocked(clientId) > 0;
+  xSemaphoreGive(clientStateMutex);
+  if (!queued && ws.availableForWrite(clientId)) {
+    ws.text(clientId, out);
+    return;
+  }
+
+  xSemaphoreTake(clientStateMutex, portMAX_DELAY);
+  bool overflow = pendingRepliesLocked(clientId) >= kMaxPendingRepliesPerClient;
+  if (!overflow) outbox.push_back({clientId, std::move(out)});
+  xSemaphoreGive(clientStateMutex);
+  if (overflow) ws.close(clientId);
+}
+
+void forgetClient(uint32_t clientId) {
+  xSemaphoreTake(clientStateMutex, portMAX_DELAY);
+  outbox.erase(std::remove_if(outbox.begin(), outbox.end(),
+                              [clientId](const PendingReply &reply) { return reply.clientId == clientId; }),
+               outbox.end());
+  partialMessages.erase(clientId);
+  xSemaphoreGive(clientStateMutex);
+}
+
+// Adds one piece of a text frame. True once the frame is complete, with
+// the whole message in `message`.
+bool appendFramePiece(uint32_t clientId, const AwsFrameInfo &info, const uint8_t *data, size_t len,
+                      String &message) {
+  xSemaphoreTake(clientStateMutex, portMAX_DELAY);
+  String &buffer = partialMessages[clientId];
+  if (info.index == 0) buffer = String();
+  bool complete = false;
+  if (buffer.length() != info.index) {
+    partialMessages.erase(clientId); // a piece went missing: drop the frame
+  } else {
+    buffer.concat(reinterpret_cast<const char *>(data), len);
+    if (buffer.length() >= info.len) {
+      message = std::move(buffer);
+      partialMessages.erase(clientId);
+      complete = true;
+    }
+  }
+  xSemaphoreGive(clientStateMutex);
+  return complete;
 }
 
 void addSubscriptionFields(JsonDocument &doc, const Subscription &sub) {
@@ -48,7 +135,7 @@ void sendHello(AsyncWebSocketClient *client) {
   limits["maxIntervalMs"] = WS_MAX_INTERVAL_MS;
   limits["maxRegisters"] = MODBUS_MAX_READ_REGISTERS;
   limits["maxBits"] = MODBUS_MAX_READ_BITS;
-  sendDoc(client->id(), doc);
+  sendReply(client->id(), doc);
 }
 
 // Reads an unsigned integer field in [min, max]; absent -> `fallback`
@@ -91,7 +178,7 @@ void handleSubscribe(uint32_t clientId, JsonVariantConst msg) {
                 "'table' must be one of holding, input, coils, discrete");
     return;
   }
-  uint16_t maxCount = isBitTable(table) ? MODBUS_MAX_READ_BITS : MODBUS_MAX_READ_REGISTERS;
+  uint16_t maxCount = maxReadCount(table);
   uint32_t slave, start, count, interval;
   if (!readUintField(clientId, id, msg, "slave", MODBUS_MIN_SLAVE_ID, MODBUS_MAX_SLAVE_ID, false,
                      DEFAULT_SLAVE_ID, slave) ||
@@ -161,18 +248,31 @@ void onEvent(AsyncWebSocket *, AsyncWebSocketClient *client, AwsEventType type, 
       sendHello(client);
       break;
     case WS_EVT_DISCONNECT:
+      forgetClient(client->id());
       submitClientGone(client->id());
       break;
     case WS_EVT_DATA: {
       auto *info = static_cast<AwsFrameInfo *>(arg);
-      // Only small, unfragmented text messages -- that's all the protocol needs.
-      bool whole = info->final && info->index == 0 && info->len == len;
-      if (!whole || info->opcode != WS_TEXT || len > WS_MAX_MESSAGE_BYTES) {
-        wsSendError(client->id(), nullptr, "invalid_message",
-                    "Messages must be a single text frame of at most 512 bytes");
+      // Only small, unfragmented text messages -- that's all the protocol
+      // needs. One such frame may still arrive in several pieces when it
+      // spans TCP segments (index > 0 or len < info->len): reassemble it.
+      bool singleFrame = info->num == 0 && info->final && info->message_opcode == WS_TEXT;
+      if (!singleFrame || info->len > WS_MAX_MESSAGE_BYTES) {
+        // Once per message, not once per piece or continuation frame.
+        if (info->num == 0 && info->index == 0) {
+          wsSendError(client->id(), nullptr, "invalid_message",
+                      "Messages must be a single text frame of at most 512 bytes");
+        }
         return;
       }
-      handleMessage(client, data, len);
+      if (info->index == 0 && info->len == len) {
+        handleMessage(client, data, len);
+        return;
+      }
+      String message;
+      if (appendFramePiece(client->id(), *info, data, len, message)) {
+        handleMessage(client, reinterpret_cast<const uint8_t *>(message.c_str()), message.length());
+      }
       break;
     }
     default:
@@ -184,6 +284,7 @@ void onEvent(AsyncWebSocket *, AsyncWebSocketClient *client, AwsEventType type, 
 
 void registerWsStream(AsyncWebServer &server) {
   pendingGoneMutex = xSemaphoreCreateMutex();
+  clientStateMutex = xSemaphoreCreateMutex();
   ws.onEvent(onEvent);
   server.addHandler(&ws);
 }
@@ -203,7 +304,48 @@ size_t wsClientCount() {
 }
 
 bool wsCanSend(uint32_t clientId) {
-  return ws.availableForWrite(clientId);
+  xSemaphoreTake(clientStateMutex, portMAX_DELAY);
+  bool queued = pendingRepliesLocked(clientId) > 0;
+  xSemaphoreGive(clientStateMutex);
+  return !queued && ws.availableForWrite(clientId);
+}
+
+void wsFlushReplies() {
+  // Sends each client's oldest reply until its queue is full again. The
+  // mutex is released around every ws.* call (see the lock order above),
+  // so the next reply is looked up again each time. A stalled client is
+  // skipped entirely: sending a later reply first would reorder them.
+  std::vector<uint32_t> stalled;
+  while (true) {
+    xSemaphoreTake(clientStateMutex, portMAX_DELAY);
+    auto next = std::find_if(outbox.begin(), outbox.end(), [&stalled](const PendingReply &reply) {
+      return std::find(stalled.begin(), stalled.end(), reply.clientId) == stalled.end();
+    });
+    if (next == outbox.end()) {
+      xSemaphoreGive(clientStateMutex);
+      return;
+    }
+    uint32_t clientId = next->clientId;
+    xSemaphoreGive(clientStateMutex);
+
+    if (!ws.availableForWrite(clientId)) {
+      stalled.push_back(clientId);
+      continue;
+    }
+
+    xSemaphoreTake(clientStateMutex, portMAX_DELAY);
+    // Re-find it: the client may have disconnected meanwhile.
+    auto reply = std::find_if(outbox.begin(), outbox.end(),
+                              [clientId](const PendingReply &r) { return r.clientId == clientId; });
+    String text;
+    bool found = reply != outbox.end();
+    if (found) {
+      text = std::move(reply->text);
+      outbox.erase(reply);
+    }
+    xSemaphoreGive(clientStateMutex);
+    if (found) ws.text(clientId, text);
+  }
 }
 
 void wsSendInterval(const Subscription &sub, const char *type) {
@@ -214,14 +356,14 @@ void wsSendInterval(const Subscription &sub, const char *type) {
   doc["count"] = sub.count;
   doc["intervalMs"] = sub.intervalMs;
   doc["effectiveIntervalMs"] = sub.reportedIntervalMs;
-  sendDoc(sub.clientId, doc);
+  sendReply(sub.clientId, doc);
 }
 
 void wsSendUnsubscribed(uint32_t clientId, const char *id) {
   JsonDocument doc;
   doc["type"] = "unsubscribed";
   doc["id"] = id;
-  sendDoc(clientId, doc);
+  sendReply(clientId, doc);
 }
 
 void wsSendSnapshot(const Subscription &sub, const uint16_t *values, uint32_t readAt) {
@@ -270,5 +412,5 @@ void wsSendError(uint32_t clientId, const char *id, const char *error, const cha
   if (id != nullptr) doc["id"] = id;
   doc["error"] = error;
   doc["message"] = message;
-  sendDoc(clientId, doc);
+  sendReply(clientId, doc);
 }

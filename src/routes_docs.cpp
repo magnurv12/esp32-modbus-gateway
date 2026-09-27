@@ -29,7 +29,7 @@ const char kSwaggerHtml[] = R"HTML(<!doctype html>
 } // namespace
 
 void registerDocsRoutes(AsyncWebServer &server) {
-  // Anchored regex -- see the comment in routes_holding.cpp.
+  // Anchored regex -- see the comment in routes_tables.cpp.
   server.on("^\\/$", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->redirect("/docs");
   });

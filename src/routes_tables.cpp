@@ -25,7 +25,7 @@ void registerRoutesFor(AsyncWebServer &server, ModbusTable table) {
   String name = tableName(table);
   String blockUri = "^\\/api\\/" + name + "$";
   String addressUri = "^\\/api\\/" + name + "\\/([0-9]+)$";
-  uint16_t maxRead = isBitTable(table) ? MODBUS_MAX_READ_BITS : MODBUS_MAX_READ_REGISTERS;
+  uint16_t maxRead = maxReadCount(table);
 
   server.on(blockUri.c_str(), HTTP_GET, [table, maxRead](AsyncWebServerRequest *request) {
     uint8_t slave;

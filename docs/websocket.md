@@ -82,7 +82,10 @@ Bus errors use the same codes as the REST API (`slave_timeout`,
 - **Only changes are sent**, and never more often than each subscription's
   own `intervalMs`. A dashboard with no changes generates no traffic.
 - **Slow clients:** when a client's send queue is full, its updates are
-  skipped and it gets a fresh `snapshot` once it catches up.
+  skipped and it gets a fresh `snapshot` once it catches up. Replies
+  (`subscribed`, `interval`, `unsubscribed`, `error`) are never skipped:
+  they wait, in order, and go out before any further data. A client that
+  falls 16 replies behind is disconnected.
 - **Failing slaves back off:** a range that fails is retried after 250 ms,
   then 500 ms, 1 s, 2 s, up to 5 s (`retryInMs`), so a dead device doesn't
   stall the others. The response timeout is `MODBUS_RESPONSE_TIMEOUT_MS`
@@ -98,8 +101,13 @@ Bus errors use the same codes as the REST API (`slave_timeout`,
 | WebSocket connections | 4 |
 | Subscriptions per connection | 8 |
 | Subscriptions on the gateway | 32 |
-| Distinct polled ranges (after merging) | 16 |
+| Distinct polled ranges (after merging) | 16 ¹ |
 | Addresses subscribed in total | 4000 |
+
+¹ Checked when subscribing. Unsubscribing never fails: removing a range that
+bridged two others can split a block and briefly leave more than 16, in
+which case new subscriptions that need another range get `too_many_blocks`
+until some leave.
 
 ## Client example
 

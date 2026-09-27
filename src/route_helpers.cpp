@@ -27,6 +27,11 @@ void registerJsonRoute(AsyncWebServer &server, const String &uri,
   server.on(
       uri.c_str(), method,
       [handler](AsyncWebServerRequest *request) {
+        if (request->contentLength() > MAX_JSON_BODY_BYTES) {
+          String message = String("Request body must be at most ") + MAX_JSON_BODY_BYTES + " bytes";
+          sendJsonError(request, 413, "body_too_large", message.c_str());
+          return;
+        }
         auto *body = static_cast<BodyBuffer *>(request->_tempObject);
         JsonDocument doc;
         if (body == nullptr || deserializeJson(doc, body->data, body->length) != DeserializationError::Ok) {
@@ -40,6 +45,12 @@ void registerJsonRoute(AsyncWebServer &server, const String &uri,
         if (index == 0) {
           // A retransmitted first chunk would otherwise leak the old buffer.
           free(request->_tempObject);
+          request->_tempObject = nullptr;
+          // `total` is the client's Content-Length (a negative one arrives
+          // wrapped to a huge size_t): never size an allocation from it
+          // unchecked. Oversized bodies are dropped here and answered 413
+          // by the request handler.
+          if (total == 0 || total > MAX_JSON_BODY_BYTES) return;
           auto *body = static_cast<BodyBuffer *>(malloc(sizeof(BodyBuffer) + total + 1));
           if (body == nullptr) {
             request->_tempObject = nullptr;
