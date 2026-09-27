@@ -1,0 +1,796 @@
+openapi: 3.0.3
+info:
+  title: ESP32 Modbus Gateway API
+  version: 2.1.0
+  description: |
+    Local REST/JSON API of an ESP32 acting as a **Modbus RTU master** on RS-485.
+
+    **Every request runs on the bus when it arrives** -- there is no cache and no
+    fixed address window: pick the slave (`?slave=`, default from `config.h`), the
+    table and the addresses per request. Requests are executed one at a time, in
+    arrival order; each takes roughly 50 ms at 9600 baud, or the ModbusMaster
+    timeout (~2 s) when the slave doesn't answer.
+
+    **Each route always issues the same Modbus function** (returned as
+    `functionCode` in every response):
+
+    | Route | Holding | Input | Coils | Discrete |
+    |---|---|---|---|---|
+    | `GET /api/<table>?start=&count=` | 03 | 04 | 01 | 02 |
+    | `GET /api/<table>/{address}` | 03 (count 1) | 04 (count 1) | 01 (count 1) | 02 (count 1) |
+    | `PUT /api/<table>/{address}` | 06 | -- (405) | 05 | -- (405) |
+    | `PUT /api/<table>` | 16 | -- (405) | 15 | -- (405) |
+
+    Modbus has no "read one" function: reads (01-04) are always block reads, and
+    reading one address is a block of 1. Writes do have single (05/06) and
+    multiple (15/16) variants -- the block `PUT` always uses 15/16, even for one
+    value, so you control which one the slave receives.
+
+    **Writes are confirmed**: `PUT` answers `200` only after the slave
+    acknowledged the write.
+
+    **Errors** carry the Modbus result (`modbusCode` / `modbusError`) when the bus
+    was involved. Addresses are decimal Modbus protocol addresses (0-65535).
+
+    ## Live data (WebSocket)
+
+    For values that must stay up to date, don't poll these routes: open a
+    WebSocket at **`/ws`**, subscribe to ranges and receive a snapshot followed
+    by only the addresses that change. The REST routes keep working alongside
+    it, and always go before live polling on the bus. A read already covered by
+    a live subscription (polled within its interval, at most 1 s ago) is
+    answered from that data and marked `"cached": true` with its `ageMs`.
+
+    Protocol: `docs/websocket.md` in the repository. Test page on the device:
+    [`/ws-test`](/ws-test).
+
+    ## The Modbus data model
+
+    A Modbus slave (servo drive, inverter, scale, PLC...) exposes its data in
+    **four independent tables**. Each table has its own address space
+    (0-65535), so holding register 5 and coil 5 are unrelated. Which table a
+    given piece of data lives in -- and at which address -- is defined by the
+    device manufacturer in its **register map** (manual/datasheet).
+
+    | Table | Size | Access | Think of it as | Typical content |
+    |---|---|---|---|---|
+    | **Coils** | 1 bit | read/write | Digital **outputs** / commands | Run/stop, enable, reset alarm, open valve |
+    | **Discrete inputs** | 1 bit | read-only | Digital **inputs** / status flags | Ready, fault, limit switch, door closed |
+    | **Input registers** | 16 bits | read-only | **Measurements** | Actual speed, current, temperature, weight |
+    | **Holding registers** | 16 bits | read/write | **Parameters & setpoints** | Target speed, acceleration, setpoint, configuration |
+
+    Rules of thumb:
+    - **Read-only** tables (inputs) describe what the device *measures or is*;
+      you can't change them over Modbus.
+    - **Read/write** tables (coils, holding) are what you *command or configure*.
+    - Values wider than 16 bits (32-bit counters, floats) span **two consecutive
+      registers**; read both with `count=2` and combine them as the manual says
+      (word order varies between manufacturers).
+    - Manuals often use the legacy 5-digit numbering: `0xxxx` coils,
+      `1xxxx` discrete inputs, `3xxxx` input registers, `4xxxx` holding
+      registers, counted from 1. E.g. `40001` is holding register **address 0**
+      in this API. Check whether the manual lists addresses (0-based) or
+      register numbers (1-based) -- being off by one is the most common mistake.
+servers:
+  - url: /
+    description: This gateway (same origin)
+  - url: http://modbus-gateway.local
+    description: mDNS name on the local network
+tags:
+  - name: Holding registers
+    description: |
+      **16-bit values you can read and write -- the device's parameters and setpoints.**
+
+      This is the most used table: most devices put nearly everything here,
+      including configuration (acceleration ramps, limits, communication
+      settings), setpoints (target speed, target position, weight setpoint) and
+      often command words (a register whose bits mean start/stop/reset).
+      Some devices also mirror their measurements here instead of using input
+      registers.
+
+      Values are unsigned 0-65535 on the wire. Signed values (e.g. `-100` stored
+      as `65436`), scaled values (e.g. `1234` meaning `12.34 Hz`) and 32-bit
+      values across two registers must be interpreted as the manual describes.
+
+      Writing changes how the equipment behaves -- on real machinery, only write
+      addresses you've confirmed in the manual.
+
+      Functions: **03** read, **06** write one, **16** write several.
+  - name: Input registers
+    description: |
+      **16-bit read-only values -- what the device measures.**
+
+      Live readings the device produces and you can only observe: actual
+      speed, motor current, DC bus voltage, temperature, weight, position,
+      counters, error codes. They change on their own as the process runs.
+
+      The same interpretation rules as holding registers apply (signed,
+      scaled or 32-bit values). `PUT` answers `405`.
+
+      Function: **04** read.
+  - name: Coils
+    description: |
+      **Single bits you can read and write -- on/off commands and digital outputs.**
+
+      Each coil is one boolean: run/stop a motor, enable a drive, reset an alarm,
+      switch a relay or valve, start a tare. Reading a coil returns its current
+      commanded state. On a PLC, coils usually map to its internal flags or
+      physical outputs.
+
+      Many drives don't implement coils at all and use bits inside a holding
+      register (a "control word") instead -- check the manual.
+
+      Functions: **01** read, **05** write one, **15** write several.
+  - name: Discrete inputs
+    description: |
+      **Single read-only bits -- status flags and digital inputs.**
+
+      Booleans that report state and can't be changed over Modbus: ready,
+      running, fault active, at speed, limit switch reached, door closed,
+      emergency stop pressed. On a PLC they usually map to physical digital
+      inputs. `PUT` answers `405`.
+
+      As with coils, many drives report these as bits inside a register (a
+      "status word") instead.
+
+      Function: **02** read.
+  - name: Status
+    description: |
+      **Health of the gateway itself** -- uptime, memory, WiFi signal -- and the
+      outcome of the latest Modbus transactions. Doesn't touch the bus.
+
+paths:
+  # ---------------------------------------------------------------- holding
+  /api/holding:
+    get:
+      tags: [Holding registers]
+      summary: Read a block of holding registers (FC 03)
+      operationId: readHoldingBlock
+      parameters:
+        - $ref: '#/components/parameters/Slave'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/CountRegisters'
+      responses:
+        '200':
+          description: Values read from the slave.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegisterBlock' }
+              example:
+                table: holding
+                slave: 1
+                functionCode: 3
+                startAddress: 1
+                count: 2
+                registers:
+                  - { address: 1, value: 33 }
+                  - { address: 2, value: 22 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+    put:
+      tags: [Holding registers]
+      summary: Write consecutive holding registers (FC 16)
+      operationId: writeHoldingBlock
+      parameters:
+        - $ref: '#/components/parameters/Slave'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WriteValuesBody' }
+            example: { startAddress: 1, values: [100, 200] }
+      responses:
+        '200':
+          description: The slave acknowledged the write.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegisterBlockWritten' }
+              example:
+                table: holding
+                slave: 1
+                functionCode: 16
+                startAddress: 1
+                count: 2
+                registers:
+                  - { address: 1, value: 100 }
+                  - { address: 2, value: 200 }
+                status: written
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+
+  /api/holding/{address}:
+    parameters:
+      - $ref: '#/components/parameters/Address'
+      - $ref: '#/components/parameters/Slave'
+    get:
+      tags: [Holding registers]
+      summary: Read one holding register (FC 03, count 1)
+      operationId: readHolding
+      responses:
+        '200':
+          description: Value read from the slave.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SingleRegister' }
+              example: { table: holding, slave: 1, functionCode: 3, address: 2, value: 22 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+    put:
+      tags: [Holding registers]
+      summary: Write one holding register (FC 06)
+      operationId: writeHolding
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WriteValueBody' }
+            example: { value: 77 }
+      responses:
+        '200':
+          description: The slave acknowledged the write.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SingleRegisterWritten' }
+              example: { table: holding, slave: 1, functionCode: 6, address: 2, value: 77, status: written }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+
+  # ------------------------------------------------------------------ input
+  /api/input:
+    get:
+      tags: [Input registers]
+      summary: Read a block of input registers (FC 04)
+      operationId: readInputBlock
+      parameters:
+        - $ref: '#/components/parameters/Slave'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/CountRegisters'
+      responses:
+        '200':
+          description: Values read from the slave.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegisterBlock' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+    put:
+      tags: [Input registers]
+      summary: Not allowed -- input registers are read-only
+      operationId: writeInputBlock
+      responses:
+        '405': { $ref: '#/components/responses/ReadOnly' }
+
+  /api/input/{address}:
+    parameters:
+      - $ref: '#/components/parameters/Address'
+      - $ref: '#/components/parameters/Slave'
+    get:
+      tags: [Input registers]
+      summary: Read one input register (FC 04, count 1)
+      operationId: readInput
+      responses:
+        '200':
+          description: Value read from the slave.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SingleRegister' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+    put:
+      tags: [Input registers]
+      summary: Not allowed -- input registers are read-only
+      operationId: writeInput
+      responses:
+        '405': { $ref: '#/components/responses/ReadOnly' }
+
+  # ------------------------------------------------------------------ coils
+  /api/coils:
+    get:
+      tags: [Coils]
+      summary: Read a block of coils (FC 01)
+      operationId: readCoilsBlock
+      parameters:
+        - $ref: '#/components/parameters/Slave'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/CountBits'
+      responses:
+        '200':
+          description: States read from the slave.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BitBlock' }
+              example:
+                table: coils
+                slave: 1
+                functionCode: 1
+                startAddress: 1
+                count: 3
+                states: [true, false, false]
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+    put:
+      tags: [Coils]
+      summary: Write consecutive coils (FC 15)
+      operationId: writeCoilsBlock
+      parameters:
+        - $ref: '#/components/parameters/Slave'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WriteStatesBody' }
+            example: { startAddress: 1, states: [true, false] }
+      responses:
+        '200':
+          description: The slave acknowledged the write.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BitBlockWritten' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+
+  /api/coils/{address}:
+    parameters:
+      - $ref: '#/components/parameters/Address'
+      - $ref: '#/components/parameters/Slave'
+    get:
+      tags: [Coils]
+      summary: Read one coil (FC 01, count 1)
+      operationId: readCoil
+      responses:
+        '200':
+          description: State read from the slave.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SingleBit' }
+              example: { table: coils, slave: 1, functionCode: 1, address: 1, state: false }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+    put:
+      tags: [Coils]
+      summary: Write one coil (FC 05)
+      operationId: writeCoil
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WriteStateBody' }
+            example: { state: true }
+      responses:
+        '200':
+          description: The slave acknowledged the write.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SingleBitWritten' }
+              example: { table: coils, slave: 1, functionCode: 5, address: 1, state: true, status: written }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+
+  # --------------------------------------------------------------- discrete
+  /api/discrete:
+    get:
+      tags: [Discrete inputs]
+      summary: Read a block of discrete inputs (FC 02)
+      operationId: readDiscreteBlock
+      parameters:
+        - $ref: '#/components/parameters/Slave'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/CountBits'
+      responses:
+        '200':
+          description: States read from the slave.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BitBlock' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+    put:
+      tags: [Discrete inputs]
+      summary: Not allowed -- discrete inputs are read-only
+      operationId: writeDiscreteBlock
+      responses:
+        '405': { $ref: '#/components/responses/ReadOnly' }
+
+  /api/discrete/{address}:
+    parameters:
+      - $ref: '#/components/parameters/Address'
+      - $ref: '#/components/parameters/Slave'
+    get:
+      tags: [Discrete inputs]
+      summary: Read one discrete input (FC 02, count 1)
+      operationId: readDiscrete
+      responses:
+        '200':
+          description: State read from the slave.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SingleBit' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/IllegalAddress' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Busy' }
+        '504': { $ref: '#/components/responses/SlaveTimeout' }
+    put:
+      tags: [Discrete inputs]
+      summary: Not allowed -- discrete inputs are read-only
+      operationId: writeDiscrete
+      responses:
+        '405': { $ref: '#/components/responses/ReadOnly' }
+
+  # ----------------------------------------------------------------- status
+  /api/health:
+    get:
+      tags: [Status]
+      summary: Gateway and Modbus link status
+      description: |
+        Always `200`. The `modbus` section covers every bus transaction (API
+        requests and live polling); `stream` describes the WebSocket side.
+      operationId: getHealth
+      responses:
+        '200':
+          description: Current status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+              example:
+                uptimeMs: 30798
+                freeHeap: 190512
+                wifiRssi: -69
+                wifiIp: 192.168.20.8
+                defaultSlave: 1
+                modbus:
+                  okCount: 42
+                  errorCount: 3
+                  lastResult: Success
+                  lastSlave: 1
+                  lastAttemptAt: 30512
+                  lastSuccessAt: 30512
+                  cacheHits: 5
+                stream:
+                  clients: 1
+                  subscriptions: 2
+                  pollBlocks: 1
+                  busLoadPct: 12.4
+                modbusLinkUp: true
+
+components:
+  parameters:
+    Address:
+      name: address
+      in: path
+      required: true
+      description: Decimal Modbus address. Non-numeric values don't match the route (`404 not_found`).
+      schema: { type: integer, minimum: 0, maximum: 65535 }
+      example: 1
+    Slave:
+      name: slave
+      in: query
+      required: false
+      description: Slave (unit) id. Defaults to `DEFAULT_SLAVE_ID` from `config.h` (see `/api/health`).
+      schema: { type: integer, minimum: 1, maximum: 247 }
+    Start:
+      name: start
+      in: query
+      required: true
+      description: First address of the block.
+      schema: { type: integer, minimum: 0, maximum: 65535 }
+      example: 1
+    CountRegisters:
+      name: count
+      in: query
+      required: true
+      description: Number of registers (Modbus limit 125). `start + count` must not exceed 65536.
+      schema: { type: integer, minimum: 1, maximum: 125 }
+      example: 2
+    CountBits:
+      name: count
+      in: query
+      required: true
+      description: Number of bits (Modbus limit 2000). `start + count` must not exceed 65536.
+      schema: { type: integer, minimum: 1, maximum: 2000 }
+      example: 1
+
+  schemas:
+    Table:
+      type: string
+      enum: [holding, input, coils, discrete]
+    Common:
+      type: object
+      required: [table, slave, functionCode]
+      properties:
+        table: { $ref: '#/components/schemas/Table' }
+        slave: { type: integer, description: Slave id the request was sent to. }
+        functionCode:
+          type: integer
+          description: Modbus function code issued (1-6, 15, 16).
+          enum: [1, 2, 3, 4, 5, 6, 15, 16]
+        cached:
+          type: boolean
+          description: |
+            Reads only, present when true: answered from a range the WebSocket
+            stream is polling instead of a fresh bus read.
+        ageMs:
+          type: integer
+          description: With `cached`, how old the data is.
+    Written:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [written] }
+
+    RegisterList:
+      type: object
+      required: [startAddress, count, registers]
+      properties:
+        startAddress: { type: integer }
+        count: { type: integer }
+        registers:
+          type: array
+          items:
+            type: object
+            required: [address, value]
+            properties:
+              address: { type: integer }
+              value: { type: integer, minimum: 0, maximum: 65535 }
+    BitList:
+      type: object
+      required: [startAddress, count, states]
+      properties:
+        startAddress: { type: integer }
+        count: { type: integer }
+        states:
+          type: array
+          description: One entry per address, starting at `startAddress`.
+          items: { type: boolean }
+
+    RegisterBlock:
+      allOf:
+        - $ref: '#/components/schemas/Common'
+        - $ref: '#/components/schemas/RegisterList'
+    RegisterBlockWritten:
+      allOf:
+        - $ref: '#/components/schemas/RegisterBlock'
+        - $ref: '#/components/schemas/Written'
+    BitBlock:
+      allOf:
+        - $ref: '#/components/schemas/Common'
+        - $ref: '#/components/schemas/BitList'
+    BitBlockWritten:
+      allOf:
+        - $ref: '#/components/schemas/BitBlock'
+        - $ref: '#/components/schemas/Written'
+    SingleRegister:
+      allOf:
+        - $ref: '#/components/schemas/Common'
+        - type: object
+          required: [address, value]
+          properties:
+            address: { type: integer }
+            value: { type: integer, minimum: 0, maximum: 65535 }
+    SingleRegisterWritten:
+      allOf:
+        - $ref: '#/components/schemas/SingleRegister'
+        - $ref: '#/components/schemas/Written'
+    SingleBit:
+      allOf:
+        - $ref: '#/components/schemas/Common'
+        - type: object
+          required: [address, state]
+          properties:
+            address: { type: integer }
+            state: { type: boolean }
+    SingleBitWritten:
+      allOf:
+        - $ref: '#/components/schemas/SingleBit'
+        - $ref: '#/components/schemas/Written'
+
+    WriteValueBody:
+      type: object
+      required: [value]
+      properties:
+        value: { type: integer, minimum: 0, maximum: 65535 }
+    WriteStateBody:
+      type: object
+      required: [state]
+      properties:
+        state: { type: boolean }
+    WriteValuesBody:
+      type: object
+      required: [startAddress, values]
+      properties:
+        startAddress: { type: integer, minimum: 0, maximum: 65535 }
+        values:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Sent as one FC 16 transaction (64 = ModbusMaster buffer limit).
+          items: { type: integer, minimum: 0, maximum: 65535 }
+    WriteStatesBody:
+      type: object
+      required: [startAddress, states]
+      properties:
+        startAddress: { type: integer, minimum: 0, maximum: 65535 }
+        states:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Sent as one FC 15 transaction.
+          items: { type: boolean }
+
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable code.
+          enum:
+            - invalid_address
+            - missing_parameter
+            - invalid_parameter
+            - invalid_body
+            - not_found
+            - read_only
+            - busy
+            - illegal_function
+            - illegal_address
+            - illegal_value
+            - slave_failure
+            - slave_timeout
+            - bad_response
+        message: { type: string, description: Human-readable explanation. }
+    ModbusError:
+      description: An error that came from the bus transaction.
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - $ref: '#/components/schemas/Common'
+        - type: object
+          required: [address, count, modbusCode, modbusError]
+          properties:
+            address: { type: integer, description: First address of the request. }
+            count: { type: integer }
+            modbusCode:
+              type: integer
+              description: |
+                ModbusMaster result. `1`-`4` are exceptions sent by the slave;
+                `224`-`227` (`0xE0`-`0xE3`) are link-level failures.
+            modbusError:
+              type: string
+              enum:
+                - IllegalFunction
+                - IllegalDataAddress
+                - IllegalDataValue
+                - SlaveDeviceFailure
+                - InvalidSlaveID
+                - InvalidFunction
+                - ResponseTimedOut
+                - InvalidCRC
+                - Unknown
+
+    Health:
+      type: object
+      required: [uptimeMs, freeHeap, wifiRssi, wifiIp, defaultSlave, modbus, stream, modbusLinkUp]
+      properties:
+        uptimeMs: { type: integer }
+        freeHeap: { type: integer, description: Free heap in bytes. }
+        wifiRssi: { type: integer, description: WiFi signal in dBm. }
+        wifiIp: { type: string }
+        defaultSlave: { type: integer, description: Slave used when `?slave=` is omitted. }
+        modbus:
+          type: object
+          properties:
+            okCount: { type: integer }
+            errorCount: { type: integer }
+            lastResult:
+              type: string
+              description: Result name of the latest transaction (`Success`, `ResponseTimedOut`, ...), or `NoRequestYet`.
+            lastSlave: { type: integer, nullable: true }
+            lastAttemptAt: { type: integer, nullable: true, description: Uptime (ms) of the latest transaction. }
+            lastSuccessAt: { type: integer, nullable: true }
+            cacheHits: { type: integer, description: REST reads answered from live-polled data. }
+        stream:
+          type: object
+          description: WebSocket live polling (see `/ws`).
+          properties:
+            clients: { type: integer, description: Open WebSocket connections. }
+            subscriptions: { type: integer }
+            pollBlocks: { type: integer, description: Distinct ranges polled after merging subscriptions. }
+            busLoadPct: { type: number, description: Estimated share of bus time used by live polling (capped at 70). }
+        modbusLinkUp:
+          type: boolean
+          description: A slave answered the latest transaction (data or a Modbus exception).
+
+  responses:
+    BadRequest:
+      description: |
+        Invalid path/query/body (`invalid_address`, `missing_parameter`,
+        `invalid_parameter`, `invalid_body`) -- the bus isn't touched -- or the
+        slave refused the function or value (`illegal_function`, `illegal_value`,
+        with `modbusCode`).
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/Error'
+              - $ref: '#/components/schemas/ModbusError'
+          example: { error: missing_parameter, message: "Query parameter 'start' is required" }
+    IllegalAddress:
+      description: The slave answered exception 02 -- it has no data at (part of) this range.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ModbusError' }
+          example:
+            error: illegal_address
+            message: The slave has no data at (part of) this address range
+            table: holding
+            slave: 1
+            functionCode: 3
+            address: 100
+            count: 10
+            modbusCode: 2
+            modbusError: IllegalDataAddress
+    BadGateway:
+      description: The slave reported a device failure (`slave_failure`) or sent a corrupt/mismatched frame (`bad_response`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ModbusError' }
+    Busy:
+      description: Too many requests already queued for the bus (queue of 8).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: busy, message: 'Too many pending Modbus requests, try again shortly' }
+    SlaveTimeout:
+      description: The slave did not answer (wiring, slave id, baud rate).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ModbusError' }
+          example:
+            error: slave_timeout
+            message: The Modbus slave did not respond (check RS-485 wiring, slave id and baud rate)
+            table: holding
+            slave: 1
+            functionCode: 3
+            address: 1
+            count: 2
+            modbusCode: 226
+            modbusError: ResponseTimedOut
+    ReadOnly:
+      description: The table cannot be written over Modbus.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: read_only, message: This table cannot be written over Modbus }

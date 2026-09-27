@@ -1,0 +1,274 @@
+#include "ws_stream.h"
+
+#include <ArduinoJson.h>
+
+#include "config.h"
+#include "json_codec.h"
+#include "modbus_task.h"
+
+namespace {
+
+AsyncWebSocket ws("/ws");
+
+// Disconnects whose ClientGone command didn't fit in the queue; retried
+// from wsMaintenance() so their subscriptions never keep polling.
+SemaphoreHandle_t pendingGoneMutex = nullptr;
+std::vector<uint32_t> pendingGone;
+
+void sendDoc(uint32_t clientId, JsonDocument &doc) {
+  String out;
+  serializeJson(doc, out);
+  ws.text(clientId, out);
+}
+
+void addSubscriptionFields(JsonDocument &doc, const Subscription &sub) {
+  doc["id"] = sub.id;
+  doc["table"] = tableName(sub.table);
+  doc["slave"] = sub.slave;
+}
+
+void submitClientGone(uint32_t clientId) {
+  StreamCommand command{};
+  command.kind = StreamCommandKind::ClientGone;
+  command.request.clientId = clientId;
+  if (submitStreamCommand(command)) return;
+  xSemaphoreTake(pendingGoneMutex, portMAX_DELAY);
+  pendingGone.push_back(clientId);
+  xSemaphoreGive(pendingGoneMutex);
+}
+
+void sendHello(AsyncWebSocketClient *client) {
+  JsonDocument doc;
+  doc["type"] = "hello";
+  doc["clientId"] = client->id();
+  doc["defaultSlave"] = DEFAULT_SLAVE_ID;
+  JsonObject limits = doc["limits"].to<JsonObject>();
+  limits["subscriptionsPerConnection"] = WS_MAX_SUBSCRIPTIONS_PER_CLIENT;
+  limits["minIntervalMs"] = WS_MIN_INTERVAL_MS;
+  limits["maxIntervalMs"] = WS_MAX_INTERVAL_MS;
+  limits["maxRegisters"] = MODBUS_MAX_READ_REGISTERS;
+  limits["maxBits"] = MODBUS_MAX_READ_BITS;
+  sendDoc(client->id(), doc);
+}
+
+// Reads an unsigned integer field in [min, max]; absent -> `fallback`
+// unless `required`. Replies with an error and returns false otherwise.
+bool readUintField(uint32_t clientId, const char *subId, JsonVariantConst msg, const char *name,
+                   uint32_t min, uint32_t max, bool required, uint32_t fallback, uint32_t &out) {
+  JsonVariantConst field = msg[name];
+  if (field.isNull() && !required) {
+    out = fallback;
+    return true;
+  }
+  if (!field.is<uint32_t>() || field.as<uint32_t>() < min || field.as<uint32_t>() > max) {
+    String message = String("'") + name + "' must be an integer from " + min + " to " + max;
+    wsSendError(clientId, subId, "invalid_parameter", message.c_str());
+    return false;
+  }
+  out = field.as<uint32_t>();
+  return true;
+}
+
+// Validates the subscription id; replies with an error when invalid.
+bool readIdField(uint32_t clientId, JsonVariantConst msg, const char *&id) {
+  id = msg["id"].as<const char *>();
+  size_t length = id == nullptr ? 0 : strlen(id);
+  if (length == 0 || length > WS_SUBSCRIPTION_ID_MAX) {
+    wsSendError(clientId, nullptr, "invalid_parameter",
+                "'id' must be a string of 1 to 32 characters");
+    return false;
+  }
+  return true;
+}
+
+void handleSubscribe(uint32_t clientId, JsonVariantConst msg) {
+  const char *id;
+  if (!readIdField(clientId, msg, id)) return;
+
+  ModbusTable table;
+  if (!parseTableName(msg["table"].as<const char *>(), table)) {
+    wsSendError(clientId, id, "invalid_parameter",
+                "'table' must be one of holding, input, coils, discrete");
+    return;
+  }
+  uint16_t maxCount = isBitTable(table) ? MODBUS_MAX_READ_BITS : MODBUS_MAX_READ_REGISTERS;
+  uint32_t slave, start, count, interval;
+  if (!readUintField(clientId, id, msg, "slave", MODBUS_MIN_SLAVE_ID, MODBUS_MAX_SLAVE_ID, false,
+                     DEFAULT_SLAVE_ID, slave) ||
+      !readUintField(clientId, id, msg, "start", 0, 0xFFFF, true, 0, start) ||
+      !readUintField(clientId, id, msg, "count", 1, maxCount, true, 0, count) ||
+      !readUintField(clientId, id, msg, "intervalMs", WS_MIN_INTERVAL_MS, WS_MAX_INTERVAL_MS, false,
+                     WS_DEFAULT_INTERVAL_MS, interval)) {
+    return;
+  }
+  if (start + count > 0x10000) {
+    wsSendError(clientId, id, "invalid_parameter", "start + count must not exceed 65536");
+    return;
+  }
+
+  StreamCommand command{};
+  command.kind = StreamCommandKind::Subscribe;
+  command.request.clientId = clientId;
+  strlcpy(command.request.id, id, sizeof(command.request.id));
+  command.request.slave = slave;
+  command.request.table = table;
+  command.request.start = start;
+  command.request.count = count;
+  command.request.intervalMs = interval;
+  if (!submitStreamCommand(command)) {
+    wsSendError(clientId, id, "busy", "Gateway is busy, try again shortly");
+  }
+}
+
+void handleUnsubscribe(uint32_t clientId, JsonVariantConst msg) {
+  const char *id;
+  if (!readIdField(clientId, msg, id)) return;
+  StreamCommand command{};
+  command.kind = StreamCommandKind::Unsubscribe;
+  command.request.clientId = clientId;
+  strlcpy(command.request.id, id, sizeof(command.request.id));
+  if (!submitStreamCommand(command)) {
+    wsSendError(clientId, id, "busy", "Gateway is busy, try again shortly");
+  }
+}
+
+void handleMessage(AsyncWebSocketClient *client, const uint8_t *data, size_t len) {
+  uint32_t clientId = client->id();
+  JsonDocument msg;
+  if (deserializeJson(msg, data, len) != DeserializationError::Ok || !msg.is<JsonObject>()) {
+    wsSendError(clientId, nullptr, "invalid_message", "Message must be a JSON object");
+    return;
+  }
+  const char *op = msg["op"].as<const char *>();
+  if (op != nullptr && strcmp(op, "subscribe") == 0) {
+    handleSubscribe(clientId, msg.as<JsonVariantConst>());
+  } else if (op != nullptr && strcmp(op, "unsubscribe") == 0) {
+    handleUnsubscribe(clientId, msg.as<JsonVariantConst>());
+  } else {
+    wsSendError(clientId, nullptr, "invalid_message", "'op' must be subscribe or unsubscribe");
+  }
+}
+
+void onEvent(AsyncWebSocket *, AsyncWebSocketClient *client, AwsEventType type, void *arg,
+             uint8_t *data, size_t len) {
+  switch (type) {
+    case WS_EVT_CONNECT:
+      if (ws.count() > WS_MAX_CLIENTS) {
+        wsSendError(client->id(), nullptr, "too_many_clients", "Connection limit reached");
+        client->close();
+        return;
+      }
+      sendHello(client);
+      break;
+    case WS_EVT_DISCONNECT:
+      submitClientGone(client->id());
+      break;
+    case WS_EVT_DATA: {
+      auto *info = static_cast<AwsFrameInfo *>(arg);
+      // Only small, unfragmented text messages -- that's all the protocol needs.
+      bool whole = info->final && info->index == 0 && info->len == len;
+      if (!whole || info->opcode != WS_TEXT || len > WS_MAX_MESSAGE_BYTES) {
+        wsSendError(client->id(), nullptr, "invalid_message",
+                    "Messages must be a single text frame of at most 512 bytes");
+        return;
+      }
+      handleMessage(client, data, len);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+} // namespace
+
+void registerWsStream(AsyncWebServer &server) {
+  pendingGoneMutex = xSemaphoreCreateMutex();
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+}
+
+void wsMaintenance() {
+  ws.cleanupClients(WS_MAX_CLIENTS);
+
+  xSemaphoreTake(pendingGoneMutex, portMAX_DELAY);
+  std::vector<uint32_t> retry;
+  retry.swap(pendingGone);
+  xSemaphoreGive(pendingGoneMutex);
+  for (uint32_t clientId : retry) submitClientGone(clientId);
+}
+
+size_t wsClientCount() {
+  return ws.count();
+}
+
+bool wsCanSend(uint32_t clientId) {
+  return ws.availableForWrite(clientId);
+}
+
+void wsSendInterval(const Subscription &sub, const char *type) {
+  JsonDocument doc;
+  doc["type"] = type;
+  addSubscriptionFields(doc, sub);
+  doc["startAddress"] = sub.start;
+  doc["count"] = sub.count;
+  doc["intervalMs"] = sub.intervalMs;
+  doc["effectiveIntervalMs"] = sub.reportedIntervalMs;
+  sendDoc(sub.clientId, doc);
+}
+
+void wsSendUnsubscribed(uint32_t clientId, const char *id) {
+  JsonDocument doc;
+  doc["type"] = "unsubscribed";
+  doc["id"] = id;
+  sendDoc(clientId, doc);
+}
+
+void wsSendSnapshot(const Subscription &sub, const uint16_t *values, uint32_t readAt) {
+  JsonDocument doc;
+  doc["type"] = "snapshot";
+  addSubscriptionFields(doc, sub);
+  doc["startAddress"] = sub.start;
+  doc["count"] = sub.count;
+  JsonArray list = doc["values"].to<JsonArray>();
+  for (uint16_t i = 0; i < sub.count; i++) list.add(values[i]);
+  doc["ts"] = readAt;
+  sendDoc(sub.clientId, doc);
+}
+
+void wsSendUpdate(const Subscription &sub, const std::vector<std::pair<uint16_t, uint16_t>> &changes,
+                  uint32_t readAt) {
+  JsonDocument doc;
+  doc["type"] = "update";
+  doc["id"] = sub.id;
+  JsonArray list = doc["changes"].to<JsonArray>();
+  for (const auto &change : changes) {
+    JsonArray pair = list.add<JsonArray>();
+    pair.add(change.first);
+    pair.add(change.second);
+  }
+  doc["ts"] = readAt;
+  sendDoc(sub.clientId, doc);
+}
+
+void wsSendModbusError(const Subscription &sub, uint8_t result, uint32_t retryInMs) {
+  ModbusFailure failure = describeModbusFailure(result);
+  JsonDocument doc;
+  doc["type"] = "error";
+  addSubscriptionFields(doc, sub);
+  doc["error"] = failure.error;
+  doc["message"] = failure.message;
+  doc["modbusCode"] = result;
+  doc["modbusError"] = modbusResultName(result);
+  doc["retryInMs"] = retryInMs;
+  sendDoc(sub.clientId, doc);
+}
+
+void wsSendError(uint32_t clientId, const char *id, const char *error, const char *message) {
+  JsonDocument doc;
+  doc["type"] = "error";
+  if (id != nullptr) doc["id"] = id;
+  doc["error"] = error;
+  doc["message"] = message;
+  sendDoc(clientId, doc);
+}

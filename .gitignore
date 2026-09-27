@@ -2,3 +2,6 @@
 .vscode/
 .DS_Store
 *.log
+
+# WiFi credentials (template: include/secrets.example.h)
+include/secrets.h
