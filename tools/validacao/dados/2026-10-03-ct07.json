@@ -1,0 +1,97 @@
+{
+ "amostras_leitura": [
+  [
+   504,
+   544.2
+  ],
+  [
+   504,
+   439.1
+  ],
+  [
+   504,
+   479.9
+  ],
+  [
+   504,
+   442.6
+  ],
+  [
+   504,
+   435.6
+  ],
+  [
+   504,
+   465.8
+  ],
+  [
+   504,
+   437.1
+  ],
+  [
+   504,
+   442.1
+  ],
+  [
+   504,
+   440.5
+  ],
+  [
+   504,
+   478.7
+  ]
+ ],
+ "escrita": {
+  "status": 504,
+  "corpo": {
+   "error": "slave_timeout",
+   "message": "The Modbus slave did not respond (check RS-485 wiring, slave id and baud rate)",
+   "table": "holding",
+   "slave": 1,
+   "functionCode": 6,
+   "address": 30,
+   "count": 1,
+   "modbusCode": 226,
+   "modbusError": "ResponseTimedOut"
+  },
+  "ms": 442.3
+ },
+ "health_durante": {
+  "okCount": 8497,
+  "errorCount": 24,
+  "lastResult": "ResponseTimedOut",
+  "lastSlave": 1,
+  "lastAttemptAt": 2384468,
+  "lastSuccessAt": 2374385,
+  "cacheHits": 0,
+  "config": {
+   "baud": 9600,
+   "format": "8N1",
+   "responseTimeoutMs": 400,
+   "defaultSlave": 1
+  }
+ },
+ "recuperou_status": 200,
+ "leitura_apos": {
+  "table": "holding",
+  "slave": 1,
+  "functionCode": 3,
+  "address": 0,
+  "value": 450
+ },
+ "health_depois": {
+  "okCount": 8498,
+  "errorCount": 101,
+  "lastResult": "Success",
+  "lastSlave": 1,
+  "lastAttemptAt": 2593511,
+  "lastSuccessAt": 2593511,
+  "cacheHits": 0,
+  "config": {
+   "baud": 9600,
+   "format": "8N1",
+   "responseTimeoutMs": 400,
+   "defaultSlave": 1
+  }
+ }
+}
