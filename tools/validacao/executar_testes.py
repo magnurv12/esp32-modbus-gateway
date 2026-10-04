@@ -260,12 +260,12 @@ def latencia():
     medir("FC15 16 coils", "PUT", "/api/coils", {"startAddress": 30, "states": [True, False] * 8})
     req("PUT", "/api/holding", {"startAddress": 30, "values": [0] * 10})
     req("PUT", "/api/coils", {"startAddress": 30, "states": [False] * 16})
-    # escravo sem resposta: poucos pontos (cada um ocupa o barramento 400 ms)
+    # escravo 2: o simulador responde com a exceção 02 (não há escravo mudo aqui; ver CT07)
     am = []
     for _ in range(10):
         s, p, ms = req("GET", "/api/holding/0?slave=2"); am.append((s, round(ms, 1)))
-    R["latencia"]["sem resposta (slave=2)"] = {"amostras": am, "mediana": round(statistics.median([m for _, m in am]), 1)}
-    print(f"   sem resposta: {am}", flush=True)
+    R["latencia"]["escravo 2 (exceção 02)"] = {"amostras": am, "mediana": round(statistics.median([m for _, m in am]), 1)}
+    print(f"   escravo 2 (exceção 02): {am}", flush=True)
 
 
 if __name__ == "__main__":

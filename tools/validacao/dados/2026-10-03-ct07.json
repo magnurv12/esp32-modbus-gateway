@@ -1,97 +1,142 @@
 {
- "amostras_leitura": [
-  [
-   504,
-   544.2
-  ],
-  [
-   504,
-   439.1
-  ],
-  [
-   504,
-   479.9
-  ],
-  [
-   504,
-   442.6
-  ],
-  [
-   504,
-   435.6
-  ],
-  [
-   504,
-   465.8
-  ],
-  [
-   504,
-   437.1
-  ],
-  [
-   504,
-   442.1
-  ],
-  [
-   504,
-   440.5
-  ],
-  [
-   504,
-   478.7
-  ]
- ],
- "escrita": {
-  "status": 504,
-  "corpo": {
-   "error": "slave_timeout",
-   "message": "The Modbus slave did not respond (check RS-485 wiring, slave id and baud rate)",
-   "table": "holding",
-   "slave": 1,
-   "functionCode": 6,
-   "address": 30,
-   "count": 1,
-   "modbusCode": 226,
-   "modbusError": "ResponseTimedOut"
+ "inicio": "2026-10-03T21:15:33",
+ "ip": "(removido)",
+ "casos": {
+  "CT07": {
+   "descricao": "Escravo sem resposta (simulador parado)",
+   "amostras_leitura": [
+    [
+     504,
+     479.0
+    ],
+    [
+     504,
+     451.4
+    ],
+    [
+     504,
+     450.4
+    ],
+    [
+     504,
+     456.8
+    ],
+    [
+     504,
+     488.8
+    ],
+    [
+     504,
+     514.8
+    ],
+    [
+     504,
+     551.8
+    ],
+    [
+     504,
+     499.6
+    ],
+    [
+     504,
+     478.2
+    ],
+    [
+     504,
+     447.0
+    ]
+   ],
+   "escrita": {
+    "status": 504,
+    "corpo": {
+     "error": "slave_timeout",
+     "message": "The Modbus slave did not respond (check RS-485 wiring, slave id and baud rate)",
+     "table": "holding",
+     "slave": 1,
+     "functionCode": 6,
+     "address": 30,
+     "count": 1,
+     "modbusCode": 226,
+     "modbusError": "ResponseTimedOut"
+    },
+    "ms": 602.8
+   },
+   "recuperacao": {
+    "status": 200,
+    "leitura": {
+     "table": "holding",
+     "slave": 1,
+     "functionCode": 3,
+     "address": 0,
+     "value": 450
+    },
+    "aguardou_s": 44
+   },
+   "transacoes_no_barramento": 45
+  }
+ },
+ "latencia": {},
+ "gateway": {
+  "firmware": {
+   "version": "33dc973",
+   "buildTime": "2026-10-04T00:06:25Z",
+   "arduinoCore": "2.0.17",
+   "idf": "v4.4.7-dirty",
+   "chip": "ESP32-D0WD-V3"
   },
-  "ms": 442.3
- },
- "health_durante": {
-  "okCount": 8497,
-  "errorCount": 24,
-  "lastResult": "ResponseTimedOut",
-  "lastSlave": 1,
-  "lastAttemptAt": 2384468,
-  "lastSuccessAt": 2374385,
-  "cacheHits": 0,
-  "config": {
+  "modbus_config": {
    "baud": 9600,
    "format": "8N1",
    "responseTimeoutMs": 400,
    "defaultSlave": 1
-  }
+  },
+  "rssi_dbm": -78,
+  "assinaturas": 0
  },
- "recuperou_status": 200,
- "leitura_apos": {
-  "table": "holding",
-  "slave": 1,
-  "functionCode": 3,
-  "address": 0,
-  "value": 450
- },
- "health_depois": {
-  "okCount": 8498,
-  "errorCount": 101,
-  "lastResult": "Success",
-  "lastSlave": 1,
-  "lastAttemptAt": 2593511,
-  "lastSuccessAt": 2593511,
-  "cacheHits": 0,
-  "config": {
-   "baud": 9600,
-   "format": "8N1",
-   "responseTimeoutMs": 400,
-   "defaultSlave": 1
-  }
+ "fim": "2026-10-03T21:17:06",
+ "health_final": {
+  "uptimeMs": 478626,
+  "freeHeap": 176784,
+  "wifiRssi": -78,
+  "wifiIp": "(removido)",
+  "defaultSlave": 1,
+  "resetReason": "power_on",
+  "wifi": {
+   "ssid": "(removido)",
+   "rssi": -78,
+   "ip": "(removido)",
+   "hostname": "modbus-gateway.local",
+   "mac": "(removido)",
+   "channel": 2
+  },
+  "firmware": {
+   "version": "33dc973",
+   "buildTime": "2026-10-04T00:06:25Z",
+   "arduinoCore": "2.0.17",
+   "idf": "v4.4.7-dirty",
+   "chip": "ESP32-D0WD-V3"
+  },
+  "modbus": {
+   "okCount": 664,
+   "errorCount": 39,
+   "lastResult": "Success",
+   "lastSlave": 1,
+   "lastAttemptAt": 478542,
+   "lastSuccessAt": 478542,
+   "cacheHits": 0,
+   "config": {
+    "baud": 9600,
+    "format": "8N1",
+    "responseTimeoutMs": 400,
+    "defaultSlave": 1
+   }
+  },
+  "stream": {
+   "clients": 0,
+   "subscriptions": 0,
+   "pollBlocks": 0,
+   "busLoadPct": 0
+  },
+  "modbusLinkUp": true
  }
 }

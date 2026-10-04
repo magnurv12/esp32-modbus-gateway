@@ -10,8 +10,8 @@ RTU para API RESTful baseado em ESP32* (cap. 4, "Resultados e discussão").
 | Escravo | [Modbux](https://github.com/ploxc/modbux) 2.3.0 simulando a estação de bombeamento EB-01 (escravo 1) |
 | Ligação ao barramento | adaptador USB/RS-485 genérico com conversor CH340 (USB 0x1A86:0x7523) |
 | Barramento | 9600 bit/s, 8N1, par A/B de bancada |
-| Gateway | ESP32-D0WD-V3, núcleo Arduino 2.0.17 / ESP-IDF 4.4.7, firmware `33dc973` |
-| Rede | Wi-Fi 2,4 GHz; RSSI do gateway entre -79 e -71 dBm durante os testes |
+| Gateway | ESP32-D0WD-V3, núcleo Arduino 2.0.17 / ESP-IDF 4.4.7, firmware `33dc973`, compilado sem modificações |
+| Rede | Wi-Fi 2,4 GHz; RSSI do gateway entre -76 e -69 dBm durante os testes |
 | Cliente | este roteiro (Python 3.9, só biblioteca padrão), no computador da bancada |
 
 O mapa de registradores da EB-01 está em
